@@ -1,0 +1,9 @@
+
+Build 
+docker build -t ora2pg .
+
+Exec:
+
+mkdir ~/volume
+docker run -v ~/volume:/opt/ora2pg/volume -it ora2pg bash
+
