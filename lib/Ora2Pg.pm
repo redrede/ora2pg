@@ -1098,6 +1098,9 @@ sub _init
 	# Minimum of lines required in a table to use parallelism
 	$self->{parallel_min_rows} ||= 100000;
 
+	# Should we export global temporary table
+	$self->{export_gtt} ||= 0;
+
 	# Should we replace zero date with something else than NULL
 	$self->{replace_zero_date} ||= '';
 	if ($self->{replace_zero_date} && (uc($self->{replace_zero_date}) ne '-INFINITY') && ($self->{replace_zero_date} !~ /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/)) {
@@ -1199,7 +1202,7 @@ sub _init
 	}
 	delete $self->{excluded}{ALL};
 
-	$self->{debug} = 1 if ($AConfig{'DEBUG'} == 1);
+	$self->{debug} = $AConfig{'DEBUG'} if ($AConfig{'DEBUG'} >= 1);
 
 	# Set default XML data extract method
 	if (not defined $self->{xml_pretty} || ($self->{xml_pretty} != 0)) {
@@ -2365,6 +2368,8 @@ sub _tables
 		$self->{tables}{$t}{table_info}{connection} = $tables_infos{$t}{connection};
 		$self->{tables}{$t}{table_info}{nologging} = $tables_infos{$t}{nologging};
 		$self->{tables}{$t}{table_info}{partitioned} = $tables_infos{$t}{partitioned};
+		$self->{tables}{$t}{table_info}{temporary} = $tables_infos{$t}{temporary};
+		$self->{tables}{$t}{table_info}{duration} = $tables_infos{$t}{duration};
 		if (exists $tables_infos{$t}{fillfactor}) {
 		    $self->{tables}{$t}{table_info}{fillfactor} = $tables_infos{$t}{fillfactor};
 		}
@@ -2974,6 +2979,9 @@ sub read_schema_from_file
 			}
 			if ($tb_param =~ /\bNOLOGGING\b/is) {
 				$self->{tables}{$tb_name}{table_info}{nologging} = 1;
+			}
+			if ($tb_param =~ /\bGLOBAL\s+TEMPORARY\b/is) {
+				$self->{tables}{$tb_name}{table_info}{temporary} = 'Y';
 			}
 
 			if ($tb_param =~ /ORGANIZATION EXTERNAL/is) {
@@ -3905,6 +3913,11 @@ sub _export_table_data
 						next if ($self->file_exists("$dirprefix${sub_tb_name}_$self->{output}"));
 					}
 
+					if ($#{$self->{tables}{$table}{field_name}} < 0) {
+						$self->logit("Table $table has no column defined, skipping...\n", 1);
+						next;
+					}
+
 					$self->logit("Dumping sub partition table $table ($subpart)...\n", 1);
 					$total_record = $self->_dump_table($dirprefix, $sql_header, $table, $subpart, 1);
 					# Rename temporary filename into final name
@@ -3972,7 +3985,12 @@ sub _export_table_data
 	else
 	{
 
-		$total_record = $self->_dump_table($dirprefix, $sql_header, $table);
+		# Do not dump data if the table has no column
+		if ($#{$self->{tables}{$table}{field_name}} < 0) {
+			$self->logit("Table $table has no column defined, skipping...\n", 1);
+		} else {
+			$total_record = $self->_dump_table($dirprefix, $sql_header, $table);
+		}
 	}
 
  	# close the connection with parallel table export
@@ -7281,7 +7299,11 @@ sub export_table
 		if ( ($obj_type eq 'TABLE') && $self->{tables}{$table}{table_info}{nologging} && !$self->{disable_unlogged} ) {
 			$obj_type = 'UNLOGGED ' . $obj_type;
 		}
-		if (exists $self->{tables}{$table}{table_as}) {
+		if ($self->{export_gtt} && !$foreign && $self->{tables}{$table}{table_info}{temporary} eq 'Y') {
+			$obj_type = ' /*GLOBAL*/ TEMPORARY TABLE' if ($obj_type =~ /TABLE/);
+		}
+		if (exists $self->{tables}{$table}{table_as})
+		{
 			if ($self->{plsql_pgsql}) {
 				$self->{tables}{$table}{table_as} = Ora2Pg::PLSQL::convert_plsql_code($self, $self->{tables}{$table}{table_as});
 			}
@@ -7622,7 +7644,17 @@ sub export_table
 					$sql_output .=  " -- Unsupported partition type, please check\n";
 				}
 			}
-			if ( ($self->{type} ne 'FDW') && !$self->{oracle_fdw_data_export} && (!$self->{external_to_fdw} || (!grep(/^$table$/i, keys %{$self->{external_table}}) && !$self->{tables}{$table}{table_info}{connection})) )
+			if ($obj_type =~ /\bTEMPORARY TABLE\b/)
+			{
+				if ($self->{tables}{$table}{table_info}{duration} eq 'SYS$TRANSACTION') {
+					$sql_output .= ' ON COMMIT DELETE ROWS';
+				} elsif ($self->{tables}{$table}{table_info}{duration} eq 'SYS$SESSION') {
+					$sql_output .= ' ON COMMIT PRESERVE ROWS';
+				}
+			}
+			if ( ($self->{type} ne 'FDW') && !$self->{oracle_fdw_data_export}
+				&& (!$self->{external_to_fdw} || (!grep(/^$table$/i, keys %{$self->{external_table}})
+						&& !$self->{tables}{$table}{table_info}{connection})) )
 			{
 				my $withoid = _make_WITH($self->{with_oid}, $self->{tables}{$table}{table_info});
 				if ($self->{use_tablespace} && $self->{tables}{$table}{table_info}{tablespace} && !grep(/^$self->{tables}{$table}{table_info}{tablespace}$/i, @{$self->{default_tablespaces}})) {
@@ -9020,6 +9052,7 @@ sub _dump_table
 			my $keyname = lc($table . '_' . $fieldname . '_t');
 			$f->[1] = $keyname;
 		}
+		$type = $self->{'modify_type'}{lc($table)}{lc($f->[0])} if (exists $self->{'modify_type'}{lc($table)}{lc($f->[0])});
 		push(@stt, uc($f->[1]));
 		push(@tt, $type);
 		push(@nn,  $fieldname);
@@ -9487,7 +9520,7 @@ sub _create_indexes
 			for ($i = 0; $i <= $#{$indexes{$idx}}; $i++)
 			{
 				if ( $indexes{$idx}->[$i] =~ /[\s\-\+\/\*]/ && $indexes{$idx}->[$i] !~ /^[^\.\s]+\s+(ASC|DESC)$/i
-				       			&& $tmp_col[$j] !~ /\s+collate\s+/i ) {
+				       			&& $indexes{$idx}->[$i] !~ /\s+collate\s+/i ) {
 					$indexes{$idx}->[$i] = '(' . $indexes{$idx}->[$i] . ')';
 				}
 			}
@@ -10525,7 +10558,7 @@ VARCHAR2
       dbms_lob.FILEGETNAME( p_bfile, l_dir, l_fname );
       SELECT DIRECTORY_PATH INTO l_path FROM $self->{prefix}_DIRECTORIES WHERE DIRECTORY_NAME = l_dir;
       l_dir := rtrim(l_path,'/');
-      RETURN l_dir || '/' || l_fname;
+      RETURN l_dir || '/' || replace(l_fname, '\\', '/');
   END IF;
   END;
 };
@@ -10547,7 +10580,7 @@ VARCHAR2
       RETURN NULL;
     ELSE
       dbms_lob.FILEGETNAME( p_bfile, l_dir, l_fname );
-      RETURN '($quote' || l_dir || '$quote,$quote' || l_fname || '$quote)';
+      RETURN '($quote' || l_dir || '$quote,$quote' || replace(l_fname, '\\', '/') || '$quote)';
   END IF;
   END;
 };
@@ -10925,9 +10958,9 @@ sub _column_info
 	$self->logit("Collecting column information for table $table...\n", 1);
 
 	if ($self->{is_mysql}) {
-		return Ora2Pg::MySQL::_column_info($self,'',$owner,'TABLE');
+		return Ora2Pg::MySQL::_column_info($self,$table,$owner,'TABLE');
 	} else {
-		return Ora2Pg::Oracle::_column_info($self,'',$owner,'TABLE');
+		return Ora2Pg::Oracle::_column_info($self,$table,$owner,'TABLE');
 	}
 }
 
@@ -10936,9 +10969,9 @@ sub _column_attributes
 	my ($self, $table, $owner, $objtype) = @_;
 
 	if ($self->{is_mysql}) {
-		return Ora2Pg::MySQL::_column_attributes($self,'',$owner,'TABLE');
+		return Ora2Pg::MySQL::_column_attributes($self,$table,$owner,'TABLE');
 	} else {
-		return Ora2Pg::Oracle::_column_attributes($self,'',$owner,'TABLE');
+		return Ora2Pg::Oracle::_column_attributes($self,$table,$owner,'TABLE');
 	}
 }
 
@@ -10947,9 +10980,9 @@ sub _encrypted_columns
 	my ($self, $table, $owner) = @_;
 
 	if ($self->{is_mysql}) {
-		return Ora2Pg::MySQL::_encrypted_columns($self,'',$owner);
+		return Ora2Pg::MySQL::_encrypted_columns($self,$table,$owner);
 	} else {
-		return Ora2Pg::Oracle::_encrypted_columns($self,'',$owner);
+		return Ora2Pg::Oracle::_encrypted_columns($self,$table,$owner);
 	}
 }
 
@@ -11754,7 +11787,7 @@ sub format_data_row
 					use Ora2Pg::GEOM;
 					my $geom_obj = new Ora2Pg::GEOM('srid' => $self->{spatial_srid}{$table}->[$idx]);
 					$geom_obj->{geometry}{srid} = '';
-					$row->[$idx] = $geom_obj->parse_sdo_geometry($row->[$idx]);
+					$row->[$idx] = $geom_obj->parse_sdo_geometry($row->[$idx]) if ($row->[$idx] =~ /^ARRAY\(0x/);
 					$row->[$idx] = 'SRID=' . $geom_obj->{geometry}{srid} . ';' . $row->[$idx];
 				}
 				elsif ($self->{geometry_extract_type} eq 'WKB')
@@ -11786,7 +11819,7 @@ sub format_data_row
 						use Ora2Pg::GEOM;
 						my $geom_obj = new Ora2Pg::GEOM('srid' => $self->{spatial_srid}{$table}->[$idx]);
 						$geom_obj->{geometry}{srid} = '';
-						$row->[$idx] = $geom_obj->parse_sdo_geometry($row->[$idx]);
+						$row->[$idx] = $geom_obj->parse_sdo_geometry($row->[$idx]) if ($row->[$idx] =~ /^ARRAY\(0x/);
 						$row->[$idx] = "ST_GeomFromText('" . $row->[$idx] . "', $geom_obj->{geometry}{srid})";
 					}
 					else
@@ -11811,7 +11844,6 @@ sub format_data_row
 		}
 		else
 		{
-
 			$row->[$idx] = $self->format_data_type($row->[$idx], $data_type, $action, $table, $src_data_types->[$idx], $idx, $colcond->[$idx], $sprep);
 
 			# Construct a WHERE clause based onb PK columns values
@@ -13503,7 +13535,7 @@ END;
 				$function .= "SECURITY DEFINER\n" if ($self->{security}{"\U$pname\E"}{security} eq 'DEFINER' && $fct_detail{code} !~ /\b(COMMIT|ROLLBACK)\s*;/i);
 			}
 		}
-		$fct_detail{immutable} = '' if ($fct_detail{code} =~ /\b(UPDATE|INSERT|DELETE)\b/is);
+		$fct_detail{immutable} = '' if ($fct_detail{code} =~ /\b(UPDATE|INSERT|DELETE|CALL)\b/is);
 		$function .= "$fct_detail{immutable};\n";
 		$function = "\n$fct_detail{before}$function";
 	}
